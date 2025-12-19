@@ -2230,7 +2230,10 @@ bool copy_back(int argc, char **argv) {
 
   /* copy undo tablespaces */
   if (srv_undo_tablespaces > 0) {
-    dst_dir = (srv_undo_dir && *srv_undo_dir) ? srv_undo_dir : mysql_data_home;
+    dst_dir = mysql_data_home;
+    if (srv_undo_dir && *srv_undo_dir && strcmp(srv_undo_dir, "./") != 0) {
+      dst_dir = srv_undo_dir;
+    }
 
     ds_data = ds_create(dst_dir, DS_TYPE_LOCAL);
 
