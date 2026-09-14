@@ -519,6 +519,17 @@ char *opt_history_user = NULL;
 char *opt_history_password = NULL;
 char *opt_history_host = NULL;
 uint opt_history_port = 0;
+char *opt_history_socket = NULL;
+uint opt_history_ssl_mode = SSL_MODE_PREFERRED;
+/* Whether a verification mode was settled for the history connection, either
+by --history-ssl-mode or implied by --history-ssl-ca and --history-ssl-capath.
+Until it is, the history connection follows --ssl-mode. */
+bool history_ssl_mode_set = false;
+bool history_ssl_mode_set_explicitly = false;
+char *opt_history_ssl_ca = NULL;
+char *opt_history_ssl_capath = NULL;
+char *opt_history_ssl_cert = NULL;
+char *opt_history_ssl_key = NULL;
 
 bool opt_decrypt = false;
 uint opt_read_buffer_size = 0;
@@ -790,6 +801,12 @@ enum options_xtrabackup {
   OPT_HISTORY_PORT,
   OPT_HISTORY_USER,
   OPT_HISTORY_PASSWORD,
+  OPT_HISTORY_SOCKET,
+  OPT_HISTORY_SSL_MODE,
+  OPT_HISTORY_SSL_CA,
+  OPT_HISTORY_SSL_CAPATH,
+  OPT_HISTORY_SSL_CERT,
+  OPT_HISTORY_SSL_KEY,
   OPT_KILL_LONG_QUERIES_TIMEOUT,
   OPT_LOCK_WAIT_TIMEOUT,
   OPT_LOCK_WAIT_THRESHOLD,
@@ -1339,32 +1356,82 @@ struct my_option xb_client_options[] = {
      "record for the current backup being taken.",
      NULL, NULL, 0, GET_STR, OPT_ARG, 0, 0, 0, 0, 0, 0},
 
-     {"history-user", OPT_HISTORY_USER,
-     "This option specifies the MySQL username used "
-     "when connecting to the server, if that's not the current user. "
-     "The option accepts a string argument. See mysql --help for details.",
-     (uchar *)&opt_history_user, (uchar *)&opt_history_user, 0, GET_STR, OPT_ARG, 0, 0, 0,
-     0, 0, 0},
+    {"history-user", OPT_HISTORY_USER,
+     "This option specifies the MySQL username used when connecting to the "
+     "server that holds the backup history table. It accepts a string "
+     "argument and defaults to the value of --user. When it is given, the "
+     "password is taken from --history-password alone, because --password "
+     "belongs to the backup account.",
+     (uchar *)&opt_history_user, (uchar *)&opt_history_user, 0, GET_STR,
+     REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
 
     {"history-host", OPT_HISTORY_HOST,
-     "This option specifies the host to use when "
-     "saving the backup history.  The option accepts "
-     "a string argument. See mysql --help for details.",
-     (uchar *)&opt_history_host, (uchar *)&opt_history_host, 0, GET_STR, OPT_ARG, 0, 0, 0,
-     0, 0, 0},
+     "This option specifies the host of the server that holds the backup "
+     "history table, for when the record cannot be written to the server "
+     "being backed up, such as a read only replica. It accepts a string "
+     "argument and defaults to the value of --host.",
+     (uchar *)&opt_history_host, (uchar *)&opt_history_host, 0, GET_STR,
+     REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
 
     {"history-port", OPT_HISTORY_PORT,
-     "This option specifies the port to use when "
-     "connecting to the database server with TCP/IP.  The option accepts "
-     "a string argument. See mysql --help for details.",
-     &opt_history_port, &opt_history_port, 0, GET_UINT, OPT_ARG, 0, 0, 0, 0, 0, 0},
+     "This option specifies the port to use when connecting to the server "
+     "that holds the backup history table with TCP/IP. It accepts a numeric "
+     "argument and defaults to the value of --port.",
+     &opt_history_port, &opt_history_port, 0, GET_UINT, REQUIRED_ARG, 0, 0,
+     65535, 0, 0, 0},
+
+    {"history-socket", OPT_HISTORY_SOCKET,
+     "This option specifies the UNIX domain socket of the server that holds "
+     "the backup history table. It accepts a string argument and defaults to "
+     "the value of --socket when no history host is named.",
+     (uchar *)&opt_history_socket, (uchar *)&opt_history_socket, 0, GET_STR,
+     REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
 
     {"history-password", OPT_HISTORY_PASSWORD,
-     "This option specifies the password to use "
-     "when connecting to the database. It accepts a string argument.  "
-     "See mysql --help for details.",
-     (uchar *)&opt_history_password, (uchar *)&opt_history_password, 0, GET_STR, OPT_ARG, 0, 0, 0,
-     0, 0, 0},
+     "This option specifies the password to use when connecting to the "
+     "server that holds the backup history table. It accepts a string "
+     "argument and defaults to the value of --password, unless "
+     "--history-user is given, in which case no password is inherited.",
+     0, 0, 0, GET_STR, OPT_ARG, 0, 0, 0, 0, 0, 0},
+
+    {"history-ssl-mode", OPT_HISTORY_SSL_MODE,
+     "This option specifies the security state of the connection to the "
+     "server that holds the backup history table. It accepts the same values "
+     "as --ssl-mode and defaults to it. Giving --history-ssl-ca or "
+     "--history-ssl-capath raises it to VERIFY_CA unless it is set here.",
+     0, 0, 0, GET_STR, REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
+
+    {"history-ssl-ca", OPT_HISTORY_SSL_CA,
+     "This option specifies the CA file in PEM format used to verify the "
+     "certificate of the server that holds the backup history table. It "
+     "accepts a string argument and defaults to the value of --ssl-ca, "
+     "unless --history-ssl-capath is given.",
+     (uchar *)&opt_history_ssl_ca, (uchar *)&opt_history_ssl_ca, 0, GET_STR,
+     REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
+
+    {"history-ssl-capath", OPT_HISTORY_SSL_CAPATH,
+     "This option specifies the directory of CA certificates used to verify "
+     "the certificate of the server that holds the backup history table. It "
+     "accepts a string argument and defaults to the value of --ssl-capath, "
+     "unless --history-ssl-ca is given.",
+     (uchar *)&opt_history_ssl_capath, (uchar *)&opt_history_ssl_capath, 0,
+     GET_STR, REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
+
+    {"history-ssl-cert", OPT_HISTORY_SSL_CERT,
+     "This option specifies the X509 certificate in PEM format presented to "
+     "the server that holds the backup history table. It accepts a string "
+     "argument and defaults to the value of --ssl-cert, unless "
+     "--history-ssl-key is given, because a certificate and its key are "
+     "inherited together or not at all.",
+     (uchar *)&opt_history_ssl_cert, (uchar *)&opt_history_ssl_cert, 0, GET_STR,
+     REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
+
+    {"history-ssl-key", OPT_HISTORY_SSL_KEY,
+     "This option specifies the X509 key in PEM format belonging to "
+     "--history-ssl-cert. It accepts a string argument and defaults to the "
+     "value of --ssl-key, unless --history-ssl-cert is given.",
+     (uchar *)&opt_history_ssl_key, (uchar *)&opt_history_ssl_key, 0, GET_STR,
+     REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
 
     {"kill-long-queries-timeout", OPT_KILL_LONG_QUERIES_TIMEOUT,
      "This option specifies the number of seconds innobackupex waits "
@@ -1946,8 +2013,8 @@ bool check_if_param_set(const char *param) {
 }
 
 bool xb_get_one_option(int optid, const struct my_option *opt, char *argument) {
-  static const char *hide_value[] = {"password", "encrypt-key",
-                                     "transition-key"};
+  static const char *hide_value[] = {"password", "history-password",
+                                     "encrypt-key", "transition-key"};
 
   param_str << "--" << opt->name;
   if (argument) {
@@ -2144,6 +2211,28 @@ bool xb_get_one_option(int optid, const struct my_option *opt, char *argument) {
         tty_password = false;
       } else
         tty_password = true;
+      break;
+    case OPT_HISTORY_PASSWORD:
+      if (argument == disabled_my_option)
+        argument = (char *)""; /* Don't require password */
+      if (argument) {
+        hide_option(argument, &opt_history_password);
+      }
+      break;
+    case OPT_HISTORY_SSL_MODE:
+      opt_history_ssl_mode =
+          find_type_or_exit(argument, &ssl_mode_typelib, opt->name);
+      history_ssl_mode_set = true;
+      history_ssl_mode_set_explicitly = true;
+      break;
+    case OPT_HISTORY_SSL_CA:
+    case OPT_HISTORY_SSL_CAPATH:
+      /* Verify the history server against the CA that was named for it, the
+      way --ssl-ca does for the backup server. */
+      if (!history_ssl_mode_set_explicitly) {
+        opt_history_ssl_mode = SSL_MODE_VERIFY_CA;
+        history_ssl_mode_set = true;
+      }
       break;
     case OPT_TRANSITION_KEY:
       if (argument == disabled_my_option)
@@ -7673,6 +7762,10 @@ bool xb_init() {
       return (false);
     }
 
+    if (!open_history_connection()) {
+      return (false);
+    }
+
     if (!get_mysql_vars(mysql_connection)) {
       return (false);
     }
@@ -7802,6 +7895,21 @@ static int check_privilege(
 }
 
 /******************************************************************/ /**
+ Fetch the privileges effective for the account a connection authenticated as.
+ @return list of SHOW GRANTS lines */
+static std::list<std::string> fetch_granted_privileges(MYSQL *connection) {
+  std::list<std::string> granted_privileges;
+  MYSQL_ROW row = 0;
+  MYSQL_RES *result = xb_mysql_query(connection, "SHOW GRANTS", true);
+  while ((row = mysql_fetch_row(result))) {
+    granted_privileges.push_back(*row);
+  }
+  mysql_free_result(result);
+
+  return granted_privileges;
+}
+
+/******************************************************************/ /**
  Check DB user privileges according to the intended actions.
 
  Fetches DB user privileges, determines intended actions based on
@@ -7814,13 +7922,22 @@ static void check_all_privileges() {
   }
 
   /* Fetch effective privileges. */
-  std::list<std::string> granted_privileges;
-  MYSQL_ROW row = 0;
-  MYSQL_RES *result = xb_mysql_query(mysql_connection, "SHOW GRANTS", true);
-  while ((row = mysql_fetch_row(result))) {
-    granted_privileges.push_back(*row);
-  }
-  mysql_free_result(result);
+  std::list<std::string> granted_privileges =
+      fetch_granted_privileges(mysql_connection);
+
+  /* The history table may live on a server of its own, reached as a different
+  account. Anything touching that table has to be checked against the grants
+  effective there, not against the ones held on the server being backed up. */
+  const std::list<std::string> history_privileges =
+      mysql_history_connection == mysql_connection
+          ? granted_privileges
+          : fetch_granted_privileges(mysql_history_connection);
+
+  /* A history server of its own is reached as an account of its own, which can
+  be held to everything the history record needs. When the record goes to the
+  server being backed up the checks below are left as they have always been,
+  so that a --check-privileges run that used to pass keeps passing. */
+  const bool separate_history_server = history_connection_requested();
 
   int check_result = PRIVILEGE_OK;
   bool reload_checked = false;
@@ -7842,17 +7959,31 @@ static void check_all_privileges() {
   /* SHOW FULL PROCESSLIST */
   check_result |= check_privilege(granted_privileges, "PROCESS", "*", "*");
 
-  if (xb_mysql_numrows(mysql_connection,
+  if (xb_mysql_numrows(mysql_history_connection,
                        "SHOW DATABASES LIKE 'PERCONA_SCHEMA';", false) == 0) {
     /* CREATE DATABASE IF NOT EXISTS PERCONA_SCHEMA */
-    check_result |= check_privilege(granted_privileges, "CREATE", "*", "*");
-  } else if (xb_mysql_numrows(mysql_connection,
+    check_result |= check_privilege(history_privileges, "CREATE", "*", "*");
+  } else if ((opt_history && separate_history_server) ||
+             xb_mysql_numrows(mysql_history_connection,
                               "SHOW TABLES IN PERCONA_SCHEMA "
                               "LIKE 'xtrabackup_history';",
                               false) == 0) {
-    /* CREATE TABLE IF NOT EXISTS PERCONA_SCHEMA.xtrabackup_history */
+    /* CREATE TABLE IF NOT EXISTS PERCONA_SCHEMA.xtrabackup_history. Two
+    reasons to require the privilege here: --history issues the statement on
+    every run and the server checks the privilege before it checks existence,
+    or the table really is missing and has to be created. */
     check_result |=
-        check_privilege(granted_privileges, "CREATE", "PERCONA_SCHEMA", "*");
+        check_privilege(history_privileges, "CREATE", "PERCONA_SCHEMA", "*");
+  }
+
+  if (opt_history && separate_history_server) {
+    /* ALTER TABLE PERCONA_SCHEMA.xtrabackup_history MODIFY COLUMN ... */
+    check_result |= check_privilege(history_privileges, "ALTER",
+                                    "PERCONA_SCHEMA", "xtrabackup_history");
+
+    /* INSERT INTO PERCONA_SCHEMA.xtrabackup_history */
+    check_result |= check_privilege(history_privileges, "INSERT",
+                                    "PERCONA_SCHEMA", "xtrabackup_history");
   }
 
   /* FLUSH NO_WRITE_TO_BINLOG ENGINE LOGS */
@@ -7880,7 +8011,7 @@ static void check_all_privileges() {
 
   /* SELECT innodb_to_lsn FROM PERCONA_SCHEMA.xtrabackup_history ... */
   if (opt_incremental_history_name || opt_incremental_history_uuid) {
-    check_result |= check_privilege(granted_privileges, "SELECT",
+    check_result |= check_privilege(history_privileges, "SELECT",
                                     "PERCONA_SCHEMA", "xtrabackup_history");
   }
 
@@ -8246,6 +8377,22 @@ int main(int argc, char **argv) {
       strcmp(xtrabackup_target_dir, "./xtrabackup_backupfiles/") == 0) {
     xb::error() << "Option --fifo-streams requires --fifo-dir to be set.";
     exit(EXIT_FAILURE);
+  }
+
+  if (xtrabackup_backup && !opt_history && !opt_incremental_history_name &&
+      !opt_incremental_history_uuid && history_connection_requested()) {
+    xb::error() << "The options describing the connection to the history "
+                   "server require --history, --incremental-history-name or "
+                   "--incremental-history-uuid to be set.";
+    exit(EXIT_FAILURE);
+  }
+
+  if (history_ssl_mode_set_explicitly &&
+      opt_history_ssl_mode < SSL_MODE_VERIFY_CA &&
+      (opt_history_ssl_ca != nullptr || opt_history_ssl_capath != nullptr)) {
+    xb::warn() << "--history-ssl-ca and --history-ssl-capath have no effect "
+                  "because --history-ssl-mode is below VERIFY_CA. The "
+                  "certificate of the history server will not be verified.";
   }
 
   if (opt_page_tracking && opt_lock_ddl == LOCK_DDL_REDUCED) {

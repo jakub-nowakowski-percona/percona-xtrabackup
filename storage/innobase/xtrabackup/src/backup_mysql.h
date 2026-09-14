@@ -177,6 +177,10 @@ extern char *buffer_pool_filename;
 /** connection to mysql server */
 extern MYSQL *mysql_connection;
 
+/** connection to the server holding PERCONA_SCHEMA.xtrabackup_history. Aliases
+mysql_connection unless a separate history server was named */
+extern MYSQL *mysql_history_connection;
+
 void capture_tool_command(int argc, char **argv);
 
 bool select_history();
@@ -188,6 +192,18 @@ bool get_mysql_vars(MYSQL *connection);
 bool detect_mysql_capabilities_for_backup();
 
 MYSQL *xb_mysql_connect();
+
+/** Determine whether the backup history record is to be written over a
+connection of its own, that is, whether any of the --history-host,
+--history-port, --history-socket, --history-user and --history-password
+options was given.
+@return true if a separate history connection was asked for */
+bool history_connection_requested();
+
+/** Open mysql_history_connection, reusing mysql_connection when the history
+table lives on the server being backed up. mysql_connection has to be open.
+@return true on success */
+bool open_history_connection();
 
 MYSQL_RES *xb_mysql_query(MYSQL *connection, const char *query, bool use_result,
                           bool die_on_error = true);

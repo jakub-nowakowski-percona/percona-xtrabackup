@@ -52,7 +52,7 @@ Place, Suite 330, Boston, MA 02111-1307 USA
 #include <srv0srv.h>
 #include <string.h>
 #include <fstream>
-#include <limits>
+#include <string>
 #include "backup_copy.h"
 #include "common.h"
 #include "components/mysqlbackup/backup_comp_constants.h"
@@ -132,6 +132,11 @@ const char *xb_stream_format_name[] = {"file", "xbstream"};
 
 MYSQL *mysql_connection;
 
+/* Connection the history table is reached over. When no history server was
+named it is the server being backed up, so this aliases mysql_connection and
+must not be closed on its own. See open_history_connection(). */
+MYSQL *mysql_history_connection;
+
 /* Whether LOCK TABLES FOR BACKUP / FLUSH TABLES WITH READ LOCK has been issued
 during backup */
 static bool tables_locked = false;
@@ -155,29 +160,43 @@ static xtrabackup::utils::time ftwrl_start_time =
 static xtrabackup::utils::time ftwrl_end_time = xtrabackup::utils::INVALID_TIME;
 #endif /* XTRABACKUP */
 
-MYSQL *xb_mysql_connect() {
+/*********************************************************************/ /**
+ Open a connection to a MySQL server.
+ @param[in]	label		role of the connection, used in the log message
+ @param[in]	host		host name, NULL for the default
+ @param[in]	user		user name, NULL to let the client library pick
+ @param[in]	password	password, NULL if the account has none
+ @param[in]	port		TCP port, 0 for the default
+ @param[in]	socket		UNIX socket path, NULL for the default
+ @param[in]	apply_ssl_options	sets the TLS settings of this connection
+ @return connection handle, or NULL if no connection could be made */
+static MYSQL *xb_mysql_connect_to(const char *label, const char *host,
+                                  const char *user, const char *password,
+                                  uint port, const char *socket,
+                                  int (*apply_ssl_options)(MYSQL *)) {
   MYSQL *connection = mysql_init(NULL);
-  char mysql_port_str[std::numeric_limits<int>::digits10 + 3];
-
-  sprintf(mysql_port_str, "%d", opt_port);
 
   if (connection == NULL) {
     xb::error() << "Failed to init MySQL struct: " << mysql_error(connection);
     return (NULL);
   }
 
-  xb::info() << "Connecting to MySQL server host: "
-             << (opt_host ? opt_host : "localhost")
-             << ", user: " << (opt_user ? opt_user : "not set")
-             << ", password: " << (opt_password ? "set" : "not set")
-             << ", port: " << (opt_port != 0 ? mysql_port_str : "not set")
-             << ", socket: " << (opt_socket ? opt_socket : "not set");
+  xb::info() << "Connecting to MySQL server " << label << ": "
+             << (host ? host : "localhost")
+             << ", user: " << (user ? user : "not set")
+             << ", password: " << (password ? "set" : "not set") << ", port: "
+             << (port != 0 ? std::to_string(port) : std::string("not set"))
+             << ", socket: " << (socket ? socket : "not set");
 
-  set_client_ssl_options(connection);
+  if (apply_ssl_options(connection) != 0) {
+    xb::warn() << "Failed to set ssl related options.";
+    if (mysql_errno(connection) != 0) {
+      xb::warn() << mysql_error(connection);
+    }
+  }
 
-  if (!mysql_real_connect(connection, opt_host ? opt_host : "localhost",
-                          opt_user, opt_password, "" /*database*/, opt_port,
-                          opt_socket, 0)) {
+  if (!mysql_real_connect(connection, host ? host : "localhost", user, password,
+                          "" /*database*/, port, socket, 0)) {
     xb::error() << "Failed to connect to MySQL server: "
                 << mysql_error(connection);
     mysql_close(connection);
@@ -208,49 +227,117 @@ MYSQL *xb_mysql_connect() {
   return (connection);
 }
 
-MYSQL *xb_mysql_history_connect() {
-  MYSQL *connection = mysql_init(NULL);
-  char mysql_port_str[std::numeric_limits<int>::digits10 + 3];
-  char mysql_history_port_str[std::numeric_limits<int>::digits10 + 3];
-
-  sprintf(mysql_port_str, "%d", opt_port);
-  sprintf(mysql_history_port_str, "%d", opt_history_port);
-
-  if (connection == NULL) {
-    xb::error() << "Failed to init MySQL struct: " << mysql_error(connection);
-    return (NULL);
-  }
-
-  xb::info() << "Connecting to MySQL server host for History: "
-             << (opt_history_host ? opt_history_host : (opt_host ? opt_host : "localhost"))
-             << ", user: " << (opt_history_user ? opt_history_user : (opt_user ? opt_user : "not set"))
-             << ", password: " << (opt_history_password ? opt_history_password : (opt_password ? "set" : "not set"))
-             << ", port: " << (opt_history_port ? mysql_history_port_str : (opt_port != 0 ? mysql_port_str : "not set"));
-
-  set_client_ssl_options(connection);
-
-  if (!mysql_real_connect(connection,
-                          (opt_history_host ? opt_history_host : (opt_host ? opt_host : "localhost")),
-                          (opt_history_user ? opt_history_user : opt_user),
-                          (opt_history_password ? opt_history_password : opt_password),
-                          "" /*database*/,
-                          (opt_history_port ? opt_history_port : opt_port),
-                          (opt_history_host ? "" : opt_socket), 0)) {
-    xb::error() << "Failed to connect to MySQL server: "
-                << mysql_error(connection);
-    mysql_close(connection);
-    return (NULL);
-  }
-
-  xb_mysql_query(connection, "SET SESSION wait_timeout=2147483", false, true);
-
-  xb_mysql_query(connection, "SET SESSION autocommit=1", false, true);
-
-  xb_mysql_query(connection, "SET NAMES utf8", false, true);
-
-  return (connection);
+MYSQL *xb_mysql_connect() {
+  return (xb_mysql_connect_to("host", opt_host, opt_user, opt_password,
+                              opt_port, opt_socket, set_client_ssl_options));
 }
 
+/*********************************************************************/ /**
+ Apply the TLS settings of the history connection. Each setting falls back to
+ the one used for the backup connection, but trust material and client
+ credentials are inherited in pairs: a CA file belonging to one server mixed
+ with a CA directory belonging to another, or a certificate without its key,
+ describes nothing.
+ @return 0 on success */
+static int set_history_ssl_options(MYSQL *connection) {
+  /* The overrides below are applied whatever this reports, so that a failure
+  to set an unrelated option cannot leave the history connection carrying the
+  TLS settings of the backup connection. */
+  int result = set_client_ssl_options(connection);
+
+  const char *ca = opt_history_ssl_ca;
+  const char *capath = opt_history_ssl_capath;
+  const char *cert = opt_history_ssl_cert;
+  const char *key = opt_history_ssl_key;
+  uint mode = history_ssl_mode_set ? opt_history_ssl_mode : opt_ssl_mode;
+
+  if (ca == nullptr && capath == nullptr) {
+    ca = opt_ssl_ca;
+    capath = opt_ssl_capath;
+  }
+
+  if (cert == nullptr && key == nullptr) {
+    cert = opt_ssl_cert;
+    key = opt_ssl_key;
+  }
+
+  /* Naming a CA is only meaningful once the certificate is actually verified,
+  which is how set_client_ssl_options() treats it too. */
+  if (mode >= SSL_MODE_VERIFY_CA) {
+    mysql_options(connection, MYSQL_OPT_SSL_CA, ca);
+    mysql_options(connection, MYSQL_OPT_SSL_CAPATH, capath);
+  } else {
+    mysql_options(connection, MYSQL_OPT_SSL_CA, nullptr);
+    mysql_options(connection, MYSQL_OPT_SSL_CAPATH, nullptr);
+  }
+
+  mysql_options(connection, MYSQL_OPT_SSL_CERT, cert);
+  mysql_options(connection, MYSQL_OPT_SSL_KEY, key);
+  mysql_options(connection, MYSQL_OPT_SSL_MODE, &mode);
+
+  return (result);
+}
+
+/*********************************************************************/ /**
+ Open the connection used to store the backup history record. It may have to
+ be a different server than the one being backed up, typically because that
+ one is a read only replica. Any option left unset falls back to the one used
+ for the backup connection, with two exceptions. The socket belongs to the
+ server being backed up, so it is only inherited when no other history server
+ was named. The password belongs to the backup account, so it is only
+ inherited together with the user it authenticates. The TLS settings follow
+ the same idea and are worked out by set_history_ssl_options().
+ @return connection handle, or NULL if no connection could be made */
+static MYSQL *xb_mysql_history_connect() {
+  const char *socket = opt_history_socket;
+  const char *user = opt_history_user;
+  const char *password = opt_history_password;
+
+  if (socket == nullptr && opt_history_host == nullptr) {
+    socket = opt_socket;
+  }
+
+  if (user == nullptr) {
+    user = opt_user;
+    if (password == nullptr) {
+      password = opt_password;
+    }
+  }
+
+  return (xb_mysql_connect_to(
+      "host for history", opt_history_host ? opt_history_host : opt_host, user,
+      password, opt_history_port ? opt_history_port : opt_port, socket,
+      set_history_ssl_options));
+}
+
+bool history_connection_requested() {
+  return (opt_history_host != nullptr || opt_history_socket != nullptr ||
+          opt_history_user != nullptr || opt_history_password != nullptr ||
+          opt_history_port != 0 || opt_history_ssl_ca != nullptr ||
+          opt_history_ssl_capath != nullptr ||
+          opt_history_ssl_cert != nullptr || opt_history_ssl_key != nullptr ||
+          history_ssl_mode_set);
+}
+
+/*********************************************************************/ /**
+ Open mysql_history_connection. It is opened up front rather than when the
+ history record is read or written, so that an unreachable history server or
+ a bad history account is reported before the backup starts instead of after
+ it has finished. When no history server was named the record belongs on the
+ server being backed up and the backup connection is reused.
+ @return true on success */
+bool open_history_connection() {
+  ut_ad(mysql_connection != nullptr);
+
+  if (!history_connection_requested()) {
+    mysql_history_connection = mysql_connection;
+    return (true);
+  }
+
+  mysql_history_connection = xb_mysql_history_connect();
+
+  return (mysql_history_connection != nullptr);
+}
 
 /*********************************************************************/ /**
  Execute mysql query. */
@@ -485,19 +572,19 @@ bool check_server_version(unsigned long version_number,
       if (version_number < 80100) {
         return false;
       }
-    auto pxb_base_ver =
-        xtrabackup::utils::get_version_number(MYSQL_SERVER_VERSION);
-    if (pxb_base_ver < version_number && version_number <= 80499) {
-      if (!opt_no_server_version_check) {
-        xb::error()
-            << "Please upgrade PXB, if a new "
-               "version is available. To continue with risk, use the option "
-               "--no-server-version-check.";
-        return false;
-      } else {
-        return true;
+      auto pxb_base_ver =
+          xtrabackup::utils::get_version_number(MYSQL_SERVER_VERSION);
+      if (pxb_base_ver < version_number && version_number <= 80499) {
+        if (!opt_no_server_version_check) {
+          xb::error()
+              << "Please upgrade PXB, if a new "
+                 "version is available. To continue with risk, use the option "
+                 "--no-server-version-check.";
+          return false;
+        } else {
+          return true;
+        }
       }
-    }
     }
     return false;
   }
@@ -671,7 +758,6 @@ bool get_mysql_vars(MYSQL *connection) {
         my_strdup(PSI_NOT_INSTRUMENTED, innodb_directories_var, MYF(MY_FAE));
   }
 
-
   if (!check_if_param_set("innodb_log_file_size") && innodb_log_file_size_var) {
     char *endptr;
 
@@ -831,7 +917,7 @@ static bool select_incremental_lsn_from_history(lsn_t *incremental_lsn) {
   char buf[100];
 
   if (opt_incremental_history_name) {
-    mysql_real_escape_string(mysql_connection, buf,
+    mysql_real_escape_string(mysql_history_connection, buf,
                              opt_incremental_history_name,
                              strlen(opt_incremental_history_name));
     snprintf(query, sizeof(query),
@@ -844,7 +930,7 @@ static bool select_incremental_lsn_from_history(lsn_t *incremental_lsn) {
   }
 
   if (opt_incremental_history_uuid) {
-    mysql_real_escape_string(mysql_connection, buf,
+    mysql_real_escape_string(mysql_history_connection, buf,
                              opt_incremental_history_uuid,
                              strlen(opt_incremental_history_uuid));
     snprintf(query, sizeof(query),
@@ -856,7 +942,7 @@ static bool select_incremental_lsn_from_history(lsn_t *incremental_lsn) {
              buf);
   }
 
-  mysql_result = xb_mysql_query(mysql_connection, query, true);
+  mysql_result = xb_mysql_query(mysql_history_connection, query, true);
 
   ut_ad(mysql_num_fields(mysql_result) == 1);
   if (!(row = mysql_fetch_row(mysql_result))) {
@@ -1993,7 +2079,6 @@ bool write_xtrabackup_info(MYSQL *connection) {
   char *xtrabackup_info_data = NULL;
   int idx;
   bool null = true;
-  MYSQL *conn = connection;
 
   const char *ins_query =
       "insert into PERCONA_SCHEMA.xtrabackup_history("
@@ -2021,17 +2106,9 @@ bool write_xtrabackup_info(MYSQL *connection) {
   uuid = get_backup_uuid(connection);
   server_version = read_mysql_one_value(connection, "SELECT VERSION()");
 
-  if (opt_history_host) {
-    // create a new connection to the history host
-    conn = xb_mysql_history_connect();
-    if (!conn) {
-      goto cleanup;
-    }
-  }
-
-  xb_mysql_query(conn, "CREATE DATABASE IF NOT EXISTS PERCONA_SCHEMA",
-                 false);
-  xb_mysql_query(conn,
+  xb_mysql_query(mysql_history_connection,
+                 "CREATE DATABASE IF NOT EXISTS PERCONA_SCHEMA", false);
+  xb_mysql_query(mysql_history_connection,
                  "CREATE TABLE IF NOT EXISTS PERCONA_SCHEMA.xtrabackup_history("
                  "uuid VARCHAR(40) NOT NULL PRIMARY KEY,"
                  "name VARCHAR(255) DEFAULT NULL,"
@@ -2056,14 +2133,27 @@ bool write_xtrabackup_info(MYSQL *connection) {
                  false);
 
   /* Upgrade from previous versions */
-  xb_mysql_query(conn,
+  xb_mysql_query(mysql_history_connection,
                  "ALTER TABLE PERCONA_SCHEMA.xtrabackup_history MODIFY COLUMN "
                  "binlog_pos TEXT DEFAULT NULL",
                  false);
 
-  stmt = mysql_stmt_init(conn);
+  /* A history record that cannot be written is reported but does not fail the
+  backup, which has already been taken successfully at this point. */
+  stmt = mysql_stmt_init(mysql_history_connection);
+  if (stmt == nullptr) {
+    xb::warn() << "failed to allocate the statement writing the backup history "
+                  "record: "
+               << mysql_error(mysql_history_connection);
+    goto cleanup;
+  }
 
-  mysql_stmt_prepare(stmt, ins_query, strlen(ins_query));
+  if (mysql_stmt_prepare(stmt, ins_query, strlen(ins_query))) {
+    xb::warn() << "failed to prepare the backup history record: "
+               << mysql_stmt_error(stmt);
+    mysql_stmt_close(stmt);
+    goto cleanup;
+  }
 
   memset(bind, 0, sizeof(bind));
   idx = 0;
@@ -2195,14 +2285,16 @@ bool write_xtrabackup_info(MYSQL *connection) {
 
   ut_ad(idx == 19);
 
-  mysql_stmt_bind_named_param(stmt, bind, sizeof(bind)/sizeof(bind[0]), nullptr);
-
-  mysql_stmt_execute(stmt);
-  mysql_stmt_close(stmt);
-
-  if (opt_history_host) {
-    mysql_close(conn);
+  if (mysql_stmt_bind_named_param(stmt, bind, sizeof(bind) / sizeof(bind[0]),
+                                  nullptr)) {
+    xb::warn() << "failed to bind the backup history record: "
+               << mysql_stmt_error(stmt);
+  } else if (mysql_stmt_execute(stmt)) {
+    xb::warn() << "failed to write the backup history record: "
+               << mysql_stmt_error(stmt);
   }
+
+  mysql_stmt_close(stmt);
 
 cleanup:
 
@@ -2267,6 +2359,14 @@ static char *make_argv(char *buf, size_t len, int argc, char **argv) {
     if (strncmp(*argv, "-p", strlen("-p")) == 0) {
       arg = "-p=...";
     }
+    if (strncmp(*argv, "--history-password", strlen("--history-password")) ==
+        0) {
+      arg = "--history-password=...";
+    }
+    if (strncmp(*argv, "--history_password", strlen("--history_password")) ==
+        0) {
+      arg = "--history_password=...";
+    }
     if (strncmp(*argv, "--encrypt-key", strlen("--encrypt-key")) == 0) {
       arg = "--encrypt-key=...";
     }
@@ -2312,8 +2412,15 @@ void backup_cleanup() {
   free(backup_uuid);
   backup_uuid = NULL;
 
+  if (mysql_history_connection != NULL &&
+      mysql_history_connection != mysql_connection) {
+    mysql_close(mysql_history_connection);
+  }
+  mysql_history_connection = NULL;
+
   if (mysql_connection) {
     mysql_close(mysql_connection);
+    mysql_connection = NULL;
   }
 }
 
