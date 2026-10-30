@@ -75,9 +75,16 @@ SET(PERCONA_KEYRING_ENCRYPTED_FILE_SOURCE
   component_callbacks.cc
 )
 
+# MacOS linker cannot find reference to xtrabackup::components::new_config_pod
+SET(XTRABACKUP_UNDEFINED_SYMBOLS "")
+IF(APPLE)
+  SET(XTRABACKUP_UNDEFINED_SYMBOLS "-undefined dynamic_lookup")
+ENDIF()
+
 SET(PERCONA_KEYRING_ENCRYPTED_FILE_LIBRARIES
   keyring_common
   OpenSSL::SSL OpenSSL::Crypto
+  ${XTRABACKUP_UNDEFINED_SYMBOLS}
 )
 
 MYSQL_ADD_COMPONENT(percona_keyring_encrypted_file
@@ -87,8 +94,6 @@ MYSQL_ADD_COMPONENT(percona_keyring_encrypted_file
 )
 
 add_dependencies(component_percona_keyring_encrypted_file GenError)
-
-MY_TARGET_LINK_OPTIONS(component_percona_keyring_encrypted_file "${LINK_FLAG_NO_UNDEFINED}")
 
 IF(APPLE)
   SET_TARGET_PROPERTIES(component_percona_keyring_encrypted_file PROPERTIES
